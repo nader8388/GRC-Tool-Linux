@@ -11,8 +11,10 @@ const multer         = require('multer');
 const XLSX           = require('xlsx');
 
 // ── Paths ─────────────────────────────────────────────────────────────
-const DATA_DIR    = path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+// When run via npx/CLI, GRC_DATA_DIR and GRC_UPLOADS_DIR are set by bin/grc-server.js
+// so data is stored in the user's working directory, not inside node_modules.
+const DATA_DIR    = process.env.GRC_DATA_DIR    || path.join(__dirname, 'data');
+const UPLOADS_DIR = process.env.GRC_UPLOADS_DIR || path.join(__dirname, 'uploads');
 const DB_FILE     = path.join(DATA_DIR, 'grc.db');
 const SESSION_DB  = path.join(DATA_DIR, 'sessions.db');
 

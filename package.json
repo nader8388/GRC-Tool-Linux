@@ -1,11 +1,35 @@
 {
   "name": "grc-assessment-server",
   "version": "1.0.0",
-  "description": "GRC Assessment Platform — Multi-user web server",
+  "description": "GRC Assessment Platform — self-hosted multi-user web server for compliance assessments (ISO 27001, NIST, SOC 2, PCI DSS and more)",
   "main": "server.js",
+  "bin": {
+    "grc-assessment-server": "./bin/grc-server.js"
+  },
+  "files": [
+    "bin/",
+    "public/",
+    "server.js"
+  ],
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "grc",
+    "compliance",
+    "assessment",
+    "iso27001",
+    "nist",
+    "soc2",
+    "pci-dss",
+    "security",
+    "audit"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
     "bcryptjs": "2.4.3",
@@ -14,7 +38,6 @@
     "express": "4.21.2",
     "express-session": "1.18.1",
     "multer": "1.4.5-lts.1",
-    "sql.js": "^1.14.1",
     "uuid": "11.1.0",
     "xlsx": "0.18.5"
   }
