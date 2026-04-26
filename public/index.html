@@ -625,7 +625,7 @@ header{height:52px;background:var(--surface);border-bottom:1px solid var(--borde
   <div class="update-progress" id="update-progress" style="display:none">
     <div class="update-progress-bar" id="update-progress-bar" style="width:0%"></div>
   </div>
-  <button class="btn btn-primary" id="update-action-btn" style="display:none;font-size:12px;padding:5px 12px" onclick="handleUpdateAction()"></button>
+  <button class="btn btn-primary" id="update-action-btn" style="display:none;font-size:12px;padding:5px 12px" onclick="applyUpdate()"></button>
   <button class="update-dismiss" id="update-dismiss-btn" onclick="dismissUpdateBanner()" title="Dismiss">✕</button>
 </div>
 
@@ -2708,7 +2708,7 @@ const api = {
   // Update — not applicable on web server
   updateDownload: async () => {},
   updateInstall:  async () => {},
-  updateCheck:    async () => {},
+  updateCheck:    async ()        { return _get('/api/update/check', {noCache:true}); },
 };
 
 // HTTP helpers
@@ -3777,98 +3777,106 @@ let currentUpdateStatus = null;
 let updateReadyVersion  = null;
 
 // Receive status pushes from main process
-window.electronAPI?.onUpdateStatus(handleUpdateStatus);
+// ── Server-based update system ────────────────────────────────────────
+// Replaces the Electron autoUpdater stubs with direct GitHub Releases API calls.
 
-function handleUpdateStatus(data) {
-  currentUpdateStatus = data.status;
+let _pendingUpdate = null; // holds the latest release info when an update is available
 
+function _setUpdateStatus(status, extra) {
+  const btn         = document.getElementById('check-updates-btn');
+  const checkStatus = document.getElementById('update-check-status');
   const banner      = document.getElementById('update-banner');
   const icon        = document.getElementById('update-icon');
   const msg         = document.getElementById('update-msg');
-  const progress    = document.getElementById('update-progress');
-  const progressBar = document.getElementById('update-progress-bar');
   const actionBtn   = document.getElementById('update-action-btn');
-  const checkStatus = document.getElementById('update-check-status');
+  const progress    = document.getElementById('update-progress');
+  if (banner)   { banner.className = 'update-banner'; }
+  if (progress) { progress.style.display = 'none'; }
+  if (actionBtn){ actionBtn.style.display = 'none'; }
 
-  if (!banner) return;
-
-  // Reset classes
-  banner.className = 'update-banner';
-  progress.style.display = 'none';
-  actionBtn.style.display = 'none';
-
-  switch (data.status) {
-
+  switch (status) {
     case 'checking':
-      if (checkStatus) checkStatus.textContent = 'Checking for updates…';
-      return;  // No banner for checking
+      if (btn)         { btn.disabled = true; btn.textContent = 'Checking…'; }
+      if (checkStatus) { checkStatus.textContent = 'Checking for updates…'; }
+      break;
 
-    case 'not-available':
-      if (checkStatus) checkStatus.textContent = '✓ You are on the latest version';
-      setTimeout(() => { if (checkStatus) checkStatus.textContent = ''; }, 4000);
-      return;  // No banner
+    case 'up-to-date':
+      if (btn)         { btn.disabled = false; btn.textContent = '⬆ Check for Updates'; }
+      if (checkStatus) { checkStatus.textContent = '✓ You are on the latest version (' + extra.current + ')'; }
+      setTimeout(() => { if (checkStatus) checkStatus.textContent = ''; }, 5000);
+      break;
 
     case 'available':
-      updateReadyVersion = data.version;
-      banner.classList.add('show', 'available');
-      icon.textContent = '⬆';
-      msg.innerHTML = `<strong>Update available: v${data.version}</strong> — Click to download in the background.`;
-      actionBtn.style.display = '';
-      actionBtn.textContent   = 'Download';
-      if (checkStatus) checkStatus.textContent = `Update available: v${data.version}`;
-      // Show version badge in settings
-      const badge = document.getElementById('update-version-badge');
-      if (badge) { badge.textContent = `v${data.version} available`; badge.style.display = ''; }
+      _pendingUpdate = extra;
+      if (btn)         { btn.disabled = false; btn.textContent = '⬆ Check for Updates'; }
+      if (checkStatus) { checkStatus.textContent = 'Update available: v' + extra.latest; }
+      if (banner)      { banner.classList.add('show', 'available'); }
+      if (icon)        { icon.textContent = '⬆'; }
+      if (msg)         { msg.innerHTML = `<strong>Update available: v${extra.latest}</strong> — <a onclick="applyUpdate()" style="color:var(--accent);cursor:pointer;text-decoration:underline">Install & Restart</a>`; }
+      if (actionBtn)   { actionBtn.style.display = ''; actionBtn.textContent = 'Install & Restart'; actionBtn.onclick = applyUpdate; }
       break;
 
-    case 'downloading':
-      banner.classList.add('show', 'downloading');
-      icon.textContent = '⬇';
-      msg.innerHTML = `Downloading update… <span style="color:var(--muted)">${data.percent}% · ${data.transferred} / ${data.total} · ${data.bytesPerSecond}</span>`;
-      progress.style.display = '';
-      progressBar.style.width = data.percent + '%';
+    case 'applying':
+      if (btn)         { btn.disabled = true; btn.textContent = 'Updating…'; }
+      if (checkStatus) { checkStatus.textContent = 'Downloading and applying update…'; }
+      if (banner)      { banner.classList.add('show', 'downloading'); }
+      if (icon)        { icon.textContent = '⬇'; }
+      if (msg)         { msg.innerHTML = 'Downloading and applying update… The server will restart automatically.'; }
       break;
 
-    case 'downloaded':
-      updateReadyVersion = data.version;
-      banner.classList.add('show', 'downloaded');
-      icon.textContent = '✓';
-      msg.innerHTML = `<strong>Update ready: v${data.version}</strong> — Restart to install.`;
-      progress.style.display = 'none';
-      actionBtn.style.display = '';
-      actionBtn.textContent   = 'Restart & Install';
-      if (checkStatus) {
-        checkStatus.textContent = '';
-        checkStatus.innerHTML = `v${data.version} ready — <a onclick="handleUpdateAction()" style="color:var(--accent);cursor:pointer;text-decoration:underline">Restart & Install</a>`;
-      }
-      // Update the check button too
-      const checkBtn = document.getElementById('check-updates-btn');
-      if (checkBtn) { checkBtn.textContent = '✓ Restart & Install'; checkBtn.onclick = handleUpdateAction; }
+    case 'restarting':
+      if (checkStatus) { checkStatus.textContent = 'Server restarting… page will reload shortly.'; }
+      if (banner)      { banner.classList.add('show', 'downloaded'); }
+      if (icon)        { icon.textContent = '✓'; }
+      if (msg)         { msg.innerHTML = '<strong>Update applied!</strong> Server is restarting…'; }
+      // Poll until the server comes back up, then reload
+      setTimeout(() => _pollForRestart(), 3000);
       break;
 
     case 'error':
-      // Only show banner if user manually triggered a check
-      if (checkStatus) checkStatus.textContent = 'Update check failed — check your internet connection';
-      setTimeout(() => { if (checkStatus) checkStatus.textContent = ''; }, 5000);
-      return;
+      if (btn)         { btn.disabled = false; btn.textContent = '⬆ Check for Updates'; }
+      if (checkStatus) { checkStatus.textContent = '⚠ ' + (extra?.message || 'Update failed'); }
+      setTimeout(() => { if (checkStatus) checkStatus.textContent = ''; }, 6000);
+      break;
   }
 }
 
-async function handleUpdateAction() {
-  if (currentUpdateStatus === 'available') {
-    // Start download
-    await window.api.updateDownload();
-    const actionBtn = document.getElementById('update-action-btn');
-    if (actionBtn) actionBtn.style.display = 'none';
-  } else if (currentUpdateStatus === 'downloaded') {
-    // Confirm restart
-    if (confirm('Restart GRC Assessment Platform to install the update?\n\nAny unsaved work will be saved automatically first.')) {
-      // Flush any pending auto-save
-      if (typeof isDirty !== 'undefined' && isDirty && selectedId) {
-        await autoSaveCtrl();
-      }
-      await window.api.updateInstall();
+function _pollForRestart(attempts) {
+  attempts = attempts || 0;
+  if (attempts > 30) { location.reload(); return; } // give up after 30s and reload anyway
+  fetch('/api/auth/status', { cache: 'no-store' })
+    .then(r => { if (r.ok) location.reload(); else throw new Error(); })
+    .catch(() => setTimeout(() => _pollForRestart(attempts + 1), 1000));
+}
+
+async function checkForUpdatesManual() {
+  _setUpdateStatus('checking');
+  try {
+    const result = await api.updateCheck();
+    if (result.error) {
+      _setUpdateStatus('error', { message: result.error });
+    } else if (result.updateAvailable) {
+      _setUpdateStatus('available', result);
+    } else {
+      _setUpdateStatus('up-to-date', result);
     }
+  } catch(e) {
+    _setUpdateStatus('error', { message: e.message });
+  }
+}
+
+async function applyUpdate() {
+  if (!_pendingUpdate?.downloadUrl) {
+    alert('No download URL available. Please check the GitHub release has a .zip asset attached.');
+    return;
+  }
+  if (!confirm(`Install update v${_pendingUpdate.latest} and restart the server?\n\nThe app will be unavailable for ~15 seconds while it restarts.`)) return;
+  _setUpdateStatus('applying');
+  try {
+    await _post('/api/update/apply', { downloadUrl: _pendingUpdate.downloadUrl });
+    _setUpdateStatus('restarting');
+  } catch(e) {
+    _setUpdateStatus('error', { message: 'Apply failed: ' + e.message });
   }
 }
 
@@ -3877,17 +3885,8 @@ function dismissUpdateBanner() {
   if (banner) banner.classList.remove('show');
 }
 
-async function checkForUpdatesManual() {
-  const btn = document.getElementById('check-updates-btn');
-  const status = document.getElementById('update-check-status');
-  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
-  if (status) status.textContent = 'Checking…';
-  await window.api.updateCheck();
-  // Re-enable after 3 seconds
-  setTimeout(() => {
-    if (btn) { btn.disabled = false; btn.textContent = '⬆ Check for Updates'; }
-  }, 3000);
-}
+// Electron stubs — no-ops in server mode
+window.electronAPI = { onUpdateStatus: () => {} };
 
 // ════════════════════════════════════════════════════════
 //  AUTH & USER MANAGEMENT (SQLite-backed via IPC)

@@ -6,6 +6,8 @@ const bcrypt         = require('bcryptjs');
 const path           = require('path');
 const fs             = require('fs');
 const crypto         = require('crypto');
+const https          = require('https');
+const { execSync }   = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const multer         = require('multer');
 const XLSX           = require('xlsx');
@@ -294,6 +296,149 @@ app.put('/api/settings/:key', requireAuth, (req, res) => {
   const { value } = req.body;
   db.prepare('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)').run(req.params.key, value);
   res.json({ ok: true });
+});
+
+// ════════════════════════════════════════════════════════
+//  UPDATE ROUTES
+// ════════════════════════════════════════════════════════
+// Check unzip is available — needed for applying updates
+try { execSync('which unzip', { stdio: 'pipe' }); }
+catch(e) { console.warn('[update] Warning: unzip not found. Install it with: sudo apt install unzip'); }
+
+const GITHUB_REPO    = 'nader8388/GRC-Tool-Linux';
+const GITHUB_API     = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+const CURRENT_VERSION = require('./package.json').version;
+
+// Helper: make an HTTPS GET request and return parsed JSON
+function githubGet(url) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      headers: {
+        'User-Agent': 'grc-assessment-server',
+        'Accept': 'application/vnd.github.v3+json',
+      }
+    };
+    https.get(url, opts, res => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch(e) { reject(new Error('Invalid JSON from GitHub API')); }
+      });
+    }).on('error', reject);
+  });
+}
+
+// Helper: download a file from a URL to a local path
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(dest);
+    const opts = { headers: { 'User-Agent': 'grc-assessment-server' } };
+    https.get(url, opts, res => {
+      // Follow redirects (GitHub assets redirect to S3)
+      if (res.statusCode === 302 || res.statusCode === 301) {
+        file.close();
+        fs.unlinkSync(dest);
+        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      res.pipe(file);
+      file.on('finish', () => file.close(resolve));
+    }).on('error', err => {
+      fs.unlink(dest, () => {});
+      reject(err);
+    });
+  });
+}
+
+// Helper: unzip a file to a destination directory using built-in unzip
+function extractZip(zipPath, destDir) {
+  execSync(`unzip -o "${zipPath}" -d "${destDir}"`, { stdio: 'pipe' });
+}
+
+// GET /api/update/check — compare current version to latest GitHub release
+app.get('/api/update/check', requireAdmin, async (req, res) => {
+  try {
+    const release = await githubGet(GITHUB_API);
+    if (release.message) {
+      // GitHub API error (e.g. rate limit or no releases yet)
+      return res.json({ current: CURRENT_VERSION, latest: null, updateAvailable: false, error: release.message });
+    }
+    const latest = release.tag_name.replace(/^v/, '');
+    const updateAvailable = latest !== CURRENT_VERSION;
+    res.json({
+      current: CURRENT_VERSION,
+      latest,
+      updateAvailable,
+      releaseUrl: release.html_url,
+      releaseName: release.name,
+      releaseNotes: release.body || '',
+      publishedAt: release.published_at,
+      // Find the zip asset
+      downloadUrl: (release.assets || []).find(a => a.name.endsWith('.zip'))?.browser_download_url || null,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/update/apply — download latest release zip and apply it, then restart via pm2
+app.post('/api/update/apply', requireAdmin, async (req, res) => {
+  const { downloadUrl } = req.body;
+  if (!downloadUrl) return res.status(400).json({ error: 'downloadUrl required' });
+
+  const tmpZip  = path.join(__dirname, '_update.zip');
+  const tmpDir  = path.join(__dirname, '_update_tmp');
+  const appDir  = __dirname;
+
+  try {
+    // 1. Download
+    res.json({ step: 'downloading' });  // immediate feedback
+  } catch(e) {
+    return res.status(500).json({ error: e.message });
+  }
+
+  // Run the rest asynchronously after responding
+  setImmediate(async () => {
+    try {
+      await downloadFile(downloadUrl, tmpZip);
+
+      // 2. Extract to temp dir
+      if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
+      fs.mkdirSync(tmpDir);
+      extractZip(tmpZip, tmpDir);
+
+      // 3. Find the extracted folder (release zips usually have one top-level folder)
+      const entries = fs.readdirSync(tmpDir);
+      const extractedFolder = entries.length === 1 && fs.statSync(path.join(tmpDir, entries[0])).isDirectory()
+        ? path.join(tmpDir, entries[0])
+        : tmpDir;
+
+      // 4. Copy new files over current install, preserving data/ and uploads/
+      const PRESERVE = new Set(['data', 'uploads', '.env', 'node_modules', '_update.zip', '_update_tmp']);
+      for (const entry of fs.readdirSync(extractedFolder)) {
+        if (PRESERVE.has(entry)) continue;
+        const src  = path.join(extractedFolder, entry);
+        const dest = path.join(appDir, entry);
+        if (fs.statSync(src).isDirectory()) {
+          fs.cpSync(src, dest, { recursive: true });
+        } else {
+          fs.copyFileSync(src, dest);
+        }
+      }
+
+      // 5. Install any new dependencies
+      execSync('npm install --production', { cwd: appDir, stdio: 'pipe' });
+
+      // 6. Clean up temp files
+      fs.unlinkSync(tmpZip);
+      fs.rmSync(tmpDir, { recursive: true });
+
+      // 7. Restart via pm2
+      execSync('pm2 restart all', { stdio: 'pipe' });
+    } catch(e) {
+      console.error('[update] Apply failed:', e);
+    }
+  });
 });
 
 // ════════════════════════════════════════════════════════
