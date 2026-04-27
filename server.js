@@ -22,46 +22,12 @@ const SESSION_DB  = path.join(DATA_DIR, 'sessions.db');
 
 [DATA_DIR, UPLOADS_DIR].forEach(d => { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); });
 
-// ── Database (better-sqlite3 via pre-built binary if available, else sql.js) ──
-let db;
-try {
-  const Database = require('better-sqlite3');
-  db = new Database(DB_FILE);
-  db.pragma('journal_mode = WAL');   // concurrent read support
-  db.pragma('foreign_keys = ON');
-  console.log('DB: better-sqlite3 (WAL mode)');
-  startServer();  // synchronous path — start immediately
-} catch (e) {
-  // Fallback: sql.js with file persistence
-  const initSqlJs  = require('sql.js');
-  let _sqlDb;
-  const loadSqlDb = async () => {
-    const SQL = await initSqlJs();
-    if (fs.existsSync(DB_FILE)) {
-      _sqlDb = new SQL.Database(fs.readFileSync(DB_FILE));
-    } else {
-      _sqlDb = new SQL.Database();
-    }
-    db = makeSqlJsAdapter(_sqlDb, DB_FILE);
-    console.log('DB: sql.js (file-backed)');
-    startServer();
-  };
-  loadSqlDb().catch(err => { console.error('DB init failed:', err); process.exit(1); });
-}
-
-function makeSqlJsAdapter(sqlDb, filePath) {
-  const save = () => fs.writeFileSync(filePath, sqlDb.export());
-  return {
-    prepare: (sql) => ({
-      run: (...args) => { sqlDb.run(sql, args); save(); return { changes: 1 }; },
-      get:  (...args) => { const r = sqlDb.exec(sql, args); return r[0]?.values[0] ? Object.fromEntries(r[0].columns.map((c,i)=>[c,r[0].values[0][i]])) : undefined; },
-      all:  (...args) => { const r = sqlDb.exec(sql, args); return r[0] ? r[0].values.map(row=>Object.fromEntries(r[0].columns.map((c,i)=>[c,row[i]]))) : []; },
-    }),
-    exec: (sql) => { sqlDb.run(sql); save(); },
-    transaction: (fn) => (...args) => { fn(...args); save(); },
-    pragma: () => {},
-  };
-}
+// ── Database (better-sqlite3) ──────────────────────────────────────────
+const Database = require('better-sqlite3');
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+console.log('DB: better-sqlite3 (WAL mode)');
 
 // ── Init schema ────────────────────────────────────────────────────────
 function initDB() {
@@ -556,13 +522,7 @@ app.post('/api/audit', requireAuth, (req, res) => {
     )));
     insertAll(entries);
   } catch(e) {
-    // sql.js fallback (no transaction wrapper)
-    entries.forEach(ev => ins.run(
-      ev.ts||new Date().toISOString(), ev.ts_display||new Date().toLocaleString(),
-      ev.std_id||'', ev.std_label||'', ev.std_color||'', ev.ctrl_id||'', ev.ctrl_name||'',
-      ev.field||'', ev.from_val||'', ev.to_val||'', ev.status||'', ev.assessor||'',
-      ev.notes_preview||'', ev.action||'saved'
-    ));
+    console.error('[audit] Batch insert failed:', e.message);
   }
   res.json({ ok: true });
 });
@@ -707,12 +667,10 @@ function makeAvatarColor(username) {
   return cols[h % cols.length];
 }
 
-// ── Start ──────────────────────────────────────────────────────────────
-function startServer() {
-  initDB();
-  app.listen(PORT, () => {
+// ── Start server ──────────────────────────────────────────────────────
+initDB();
+app.listen(PORT, () => {
   console.log(`GRC Assessment Server running on http://localhost:${PORT}`);
   console.log(`Data directory: ${DATA_DIR}`);
   console.log(`Uploads directory: ${UPLOADS_DIR}`);
-  });
-}
+});

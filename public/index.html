@@ -2708,7 +2708,7 @@ const api = {
   // Update — not applicable on web server
   updateDownload: async () => {},
   updateInstall:  async () => {},
-  updateCheck:    async ()        { return _get('/api/update/check', {noCache:true}); },
+  updateCheck:    async ()     => { return _get('/api/update/check', {noCache:true}); },
 };
 
 // HTTP helpers
