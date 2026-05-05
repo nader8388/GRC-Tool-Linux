@@ -6682,6 +6682,7 @@ let activeStd    = null;
 let assessData   = {};
 let metaData     = {};
 let selectedId   = null;
+let _selectingCtrl = false; // lock to prevent race condition on rapid control switching
 let activeFilter = 'all';
 let searchQ      = '';
 let pickerSel    = null;
@@ -7038,27 +7039,32 @@ function renderList() {
 //  CONTROL DETAIL
 // ════════════════════════════════════════════════════════
 async function selectCtrl(id) {
-  // If switching away from a dirty control, auto-save it first
-  if (selectedId && selectedId !== id && isDirty) {
-    await autoSaveCtrl();
-  }
-  selectedId = id;
-  aiResult   = null;
-  renderList();
-  const ctrl = activeStd.controls.find(c=>c.id===id);
-  if (!ctrl) return;
-  const d = assessData[id]||{};
+  // Prevent race condition when clicking controls rapidly
+  if (_selectingCtrl) return;
+  _selectingCtrl = true;
+  try {
+    // If switching away from a dirty control, auto-save it first
+    if (selectedId && selectedId !== id && isDirty) {
+      await autoSaveCtrl();
+    }
+    // If user clicked a different control while we were saving, use that one
+    selectedId = id;
+    aiResult   = null;
+    renderList();
+    const ctrl = activeStd.controls.find(c=>c.id===id);
+    if (!ctrl) return;
+    const d = assessData[id]||{};
 
-  document.getElementById('empty-state').classList.add('hidden');
-  document.getElementById('detail-panel').classList.remove('hidden');
+    document.getElementById('empty-state').classList.add('hidden');
+    document.getElementById('detail-panel').classList.remove('hidden');
 
-  const groupName = activeStd.groups[activeStd.getGroup(ctrl)]||activeStd.getGroup(ctrl);
+    const groupName = activeStd.groups[activeStd.getGroup(ctrl)]||activeStd.getGroup(ctrl);
 
-  // ── Sub-procedure mode ────────────────────────────────────────────
-  if (activeStd.hasProcedures) {
-    renderProcedureDetail(ctrl, groupName);
-    return;
-  }
+    // ── Sub-procedure mode ────────────────────────────────────────────
+    if (activeStd.hasProcedures) {
+      renderProcedureDetail(ctrl, groupName);
+      return;
+    }
 
   const statusOpts = activeStd.statusOptions.map(o =>
     `<label class="s-opt ${d.status===o.val?o.cls:''}" id="so-${o.val}">
@@ -7185,6 +7191,9 @@ async function selectCtrl(id) {
   // Auto-save: take a clean snapshot of the freshly loaded form
   markClean();
   attachDirtyListeners();
+  } finally {
+    _selectingCtrl = false;
+  }
 }
 
 function onStatusChange(val) {
@@ -7415,7 +7424,8 @@ async function loadProcAttachments(ctrl) {
       assessData[key]._attachments = list;
     } catch(e) {}
   }
-  // Re-render to show attachments
+  // Only re-render if this control is still selected — prevents glitch when switching fast
+  if (selectedId !== ctrl.id) return;
   const groupName = activeStd.groups[activeStd.getGroup(ctrl)]||activeStd.getGroup(ctrl);
   renderProcedureDetail(ctrl, groupName);
 }
