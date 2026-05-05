@@ -6,17 +6,13 @@ const bcrypt         = require('bcryptjs');
 const path           = require('path');
 const fs             = require('fs');
 const crypto         = require('crypto');
-const https          = require('https');
-const { execSync }   = require('child_process');
 const { v4: uuidv4 } = require('uuid');
 const multer         = require('multer');
 const XLSX           = require('xlsx');
 
 // ── Paths ─────────────────────────────────────────────────────────────
-// When run via npx/CLI, GRC_DATA_DIR and GRC_UPLOADS_DIR are set by bin/grc-server.js
-// so data is stored in the user's working directory, not inside node_modules.
-const DATA_DIR    = process.env.GRC_DATA_DIR    || path.join(__dirname, 'data');
-const UPLOADS_DIR = process.env.GRC_UPLOADS_DIR || path.join(__dirname, 'uploads');
+const DATA_DIR    = path.join(__dirname, 'data');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const DB_FILE     = path.join(DATA_DIR, 'grc.db');
 const SESSION_DB  = path.join(DATA_DIR, 'sessions.db');
 
@@ -52,6 +48,7 @@ function initDB() {
     CREATE TABLE IF NOT EXISTS assessments (
       std_id     TEXT NOT NULL,
       ctrl_id    TEXT NOT NULL,
+      proc_id    TEXT NOT NULL DEFAULT '',
       status     TEXT DEFAULT '',
       notes      TEXT DEFAULT '',
       finding    TEXT DEFAULT '',
@@ -62,7 +59,7 @@ function initDB() {
       ai_input   TEXT DEFAULT '',
       evidence   TEXT DEFAULT '[]',
       saved_at   TEXT,
-      PRIMARY KEY (std_id, ctrl_id)
+      PRIMARY KEY (std_id, ctrl_id, proc_id)
     );
 
     CREATE TABLE IF NOT EXISTS meta (
@@ -76,11 +73,12 @@ function initDB() {
       id       TEXT PRIMARY KEY,
       std_id   TEXT NOT NULL,
       ctrl_id  TEXT NOT NULL,
+      proc_id  TEXT NOT NULL DEFAULT '',
       name     TEXT NOT NULL,
       path     TEXT NOT NULL,
       size     INTEGER NOT NULL DEFAULT 0,
       added    TEXT NOT NULL,
-      UNIQUE(std_id, ctrl_id, name)
+      UNIQUE(std_id, ctrl_id, proc_id, name)
     );
 
     CREATE TABLE IF NOT EXISTS audit_log (
@@ -92,6 +90,7 @@ function initDB() {
       std_color     TEXT NOT NULL DEFAULT '',
       ctrl_id       TEXT NOT NULL,
       ctrl_name     TEXT NOT NULL,
+      proc_id       TEXT NOT NULL DEFAULT '',
       field         TEXT NOT NULL,
       from_val      TEXT DEFAULT '',
       to_val        TEXT DEFAULT '',
@@ -102,10 +101,27 @@ function initDB() {
     );
 
     CREATE INDEX IF NOT EXISTS idx_assessments    ON assessments(std_id);
+    CREATE INDEX IF NOT EXISTS idx_assessments_ctrl ON assessments(std_id, ctrl_id);
     CREATE INDEX IF NOT EXISTS idx_audit_ts       ON audit_log(ts);
     CREATE INDEX IF NOT EXISTS idx_audit_std      ON audit_log(std_id);
     CREATE INDEX IF NOT EXISTS idx_attach_ctrl    ON attachments(std_id, ctrl_id);
   `);
+
+  // ── Migrations for existing databases ─────────────────────────────
+  // Safely add proc_id columns if upgrading from a pre-sub-procedure version
+  const migrations = [
+    { table: 'assessments', col: 'proc_id',  sql: "ALTER TABLE assessments ADD COLUMN proc_id TEXT NOT NULL DEFAULT ''" },
+    { table: 'attachments', col: 'proc_id',  sql: "ALTER TABLE attachments ADD COLUMN proc_id TEXT NOT NULL DEFAULT ''" },
+    { table: 'audit_log',   col: 'proc_id',  sql: "ALTER TABLE audit_log   ADD COLUMN proc_id TEXT NOT NULL DEFAULT ''" },
+  ];
+  for (const m of migrations) {
+    const cols = db.prepare(`PRAGMA table_info(${m.table})`).all().map(c => c.name);
+    if (!cols.includes(m.col)) {
+      db.exec(m.sql);
+      console.log(`[migration] Added ${m.col} to ${m.table}`);
+    }
+  }
+
   console.log('DB schema ready');
 }
 
@@ -164,9 +180,6 @@ function requireAdmin(req, res, next) {
 //  AUTH ROUTES
 // ════════════════════════════════════════════════════════
 app.get('/api/auth/status', (req, res) => {
-  // Never cache — must always reflect real server session state
-  res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
-  res.set('Pragma', 'no-cache');
   if (!req.session?.userId) return res.json({ authenticated: false });
   const user = db.prepare('SELECT id,name,username,role,color,must_change_password,last_login FROM users WHERE id=?').get(req.session.userId);
   if (!user) return res.json({ authenticated: false });
@@ -265,160 +278,23 @@ app.put('/api/settings/:key', requireAuth, (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════
-//  UPDATE ROUTES
-// ════════════════════════════════════════════════════════
-// Check unzip is available — needed for applying updates
-try { execSync('which unzip', { stdio: 'pipe' }); }
-catch(e) { console.warn('[update] Warning: unzip not found. Install it with: sudo apt install unzip'); }
-
-const GITHUB_REPO    = 'nader8388/GRC-Tool-Linux';
-const GITHUB_API     = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
-const CURRENT_VERSION = require('./package.json').version;
-
-// Helper: make an HTTPS GET request and return parsed JSON
-function githubGet(url) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      headers: {
-        'User-Agent': 'grc-assessment-server',
-        'Accept': 'application/vnd.github.v3+json',
-      }
-    };
-    https.get(url, opts, res => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(e) { reject(new Error('Invalid JSON from GitHub API')); }
-      });
-    }).on('error', reject);
-  });
-}
-
-// Helper: download a file from a URL to a local path
-function downloadFile(url, dest) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    const opts = { headers: { 'User-Agent': 'grc-assessment-server' } };
-    https.get(url, opts, res => {
-      // Follow redirects (GitHub assets redirect to S3)
-      if (res.statusCode === 302 || res.statusCode === 301) {
-        file.close();
-        fs.unlinkSync(dest);
-        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
-      }
-      res.pipe(file);
-      file.on('finish', () => file.close(resolve));
-    }).on('error', err => {
-      fs.unlink(dest, () => {});
-      reject(err);
-    });
-  });
-}
-
-// Helper: unzip a file to a destination directory using built-in unzip
-function extractZip(zipPath, destDir) {
-  execSync(`unzip -o "${zipPath}" -d "${destDir}"`, { stdio: 'pipe' });
-}
-
-// GET /api/update/check — compare current version to latest GitHub release
-app.get('/api/update/check', requireAdmin, async (req, res) => {
-  try {
-    const release = await githubGet(GITHUB_API);
-    if (release.message) {
-      // GitHub API error (e.g. rate limit or no releases yet)
-      return res.json({ current: CURRENT_VERSION, latest: null, updateAvailable: false, error: release.message });
-    }
-    const latest = release.tag_name.replace(/^v/, '');
-    const updateAvailable = latest !== CURRENT_VERSION;
-    res.json({
-      current: CURRENT_VERSION,
-      latest,
-      updateAvailable,
-      releaseUrl: release.html_url,
-      releaseName: release.name,
-      releaseNotes: release.body || '',
-      publishedAt: release.published_at,
-      // Find the zip asset
-      downloadUrl: (release.assets || []).find(a => a.name.endsWith('.zip'))?.browser_download_url || null,
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/update/apply — download latest release zip and apply it, then restart via pm2
-app.post('/api/update/apply', requireAdmin, async (req, res) => {
-  const { downloadUrl } = req.body;
-  if (!downloadUrl) return res.status(400).json({ error: 'downloadUrl required' });
-
-  const tmpZip  = path.join(__dirname, '_update.zip');
-  const tmpDir  = path.join(__dirname, '_update_tmp');
-  const appDir  = __dirname;
-
-  try {
-    // 1. Download
-    res.json({ step: 'downloading' });  // immediate feedback
-  } catch(e) {
-    return res.status(500).json({ error: e.message });
-  }
-
-  // Run the rest asynchronously after responding
-  setImmediate(async () => {
-    try {
-      await downloadFile(downloadUrl, tmpZip);
-
-      // 2. Extract to temp dir
-      if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true });
-      fs.mkdirSync(tmpDir);
-      extractZip(tmpZip, tmpDir);
-
-      // 3. Find the extracted folder (release zips usually have one top-level folder)
-      const entries = fs.readdirSync(tmpDir);
-      const extractedFolder = entries.length === 1 && fs.statSync(path.join(tmpDir, entries[0])).isDirectory()
-        ? path.join(tmpDir, entries[0])
-        : tmpDir;
-
-      // 4. Copy new files over current install, preserving data/ and uploads/
-      const PRESERVE = new Set(['data', 'uploads', '.env', 'node_modules', '_update.zip', '_update_tmp']);
-      for (const entry of fs.readdirSync(extractedFolder)) {
-        if (PRESERVE.has(entry)) continue;
-        const src  = path.join(extractedFolder, entry);
-        const dest = path.join(appDir, entry);
-        if (fs.statSync(src).isDirectory()) {
-          fs.cpSync(src, dest, { recursive: true });
-        } else {
-          fs.copyFileSync(src, dest);
-        }
-      }
-
-      // 5. Install any new dependencies
-      execSync('npm install --production', { cwd: appDir, stdio: 'pipe' });
-
-      // 6. Clean up temp files
-      fs.unlinkSync(tmpZip);
-      fs.rmSync(tmpDir, { recursive: true });
-
-      // 7. Restart via pm2
-      execSync('pm2 restart all', { stdio: 'pipe' });
-    } catch(e) {
-      console.error('[update] Apply failed:', e);
-    }
-  });
-});
-
-// ════════════════════════════════════════════════════════
 //  ASSESSMENT ROUTES
 // ════════════════════════════════════════════════════════
 app.get('/api/assessments/:stdId', requireAuth, (req, res) => {
   const rows = db.prepare('SELECT * FROM assessments WHERE std_id=?').all(req.params.stdId);
   const result = {};
   rows.forEach(r => {
-    result[r.ctrl_id] = {
+    // Key by ctrl_id + proc_id so both flat and sub-procedure standards work.
+    // For flat standards proc_id is '', key is just ctrl_id.
+    // For sub-procedure standards key is 'ctrl_id::proc_id'.
+    const key = r.proc_id ? `${r.ctrl_id}::${r.proc_id}` : r.ctrl_id;
+    result[key] = {
       status: r.status, notes: r.notes, finding: r.finding,
       recommendation: r.recommendation, risk: r.risk, remdate: r.remdate,
       assessor: r.assessor, aiInput: r.ai_input,
       evidence: tryJSON(r.evidence, []),
+      procId: r.proc_id || '',
+      ctrlId: r.ctrl_id,
     };
   });
   res.json(result);
@@ -427,10 +303,11 @@ app.get('/api/assessments/:stdId', requireAuth, (req, res) => {
 app.put('/api/assessments/:stdId/:ctrlId', requireAuth, (req, res) => {
   const { stdId, ctrlId } = req.params;
   const d = req.body;
+  const procId = d.procId || '';
   db.prepare(`INSERT OR REPLACE INTO assessments
-    (std_id,ctrl_id,status,notes,finding,recommendation,risk,remdate,assessor,ai_input,evidence,saved_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).run(
-    stdId, ctrlId, d.status||'', d.notes||'', d.finding||'',
+    (std_id,ctrl_id,proc_id,status,notes,finding,recommendation,risk,remdate,assessor,ai_input,evidence,saved_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    stdId, ctrlId, procId, d.status||'', d.notes||'', d.finding||'',
     d.recommendation||'', d.risk||'', d.remdate||'', d.assessor||'',
     d.aiInput||'', JSON.stringify(d.evidence||[]), new Date().toISOString()
   );
@@ -438,7 +315,16 @@ app.put('/api/assessments/:stdId/:ctrlId', requireAuth, (req, res) => {
 });
 
 app.delete('/api/assessments/:stdId/:ctrlId', requireAuth, (req, res) => {
-  db.prepare('DELETE FROM assessments WHERE std_id=? AND ctrl_id=?').run(req.params.stdId, req.params.ctrlId);
+  const procId = req.query.procId;
+  if (procId !== undefined) {
+    // Delete a specific sub-procedure
+    db.prepare('DELETE FROM assessments WHERE std_id=? AND ctrl_id=? AND proc_id=?')
+      .run(req.params.stdId, req.params.ctrlId, procId);
+  } else {
+    // Delete all sub-procedures for this control (flat controls have proc_id='')
+    db.prepare('DELETE FROM assessments WHERE std_id=? AND ctrl_id=?')
+      .run(req.params.stdId, req.params.ctrlId);
+  }
   res.json({ ok: true });
 });
 
@@ -467,40 +353,49 @@ app.put('/api/meta/:stdId/:key', requireAuth, (req, res) => {
 //  ATTACHMENTS ROUTES
 // ════════════════════════════════════════════════════════
 app.get('/api/attachments/:stdId/:ctrlId', requireAuth, (req, res) => {
-  const rows = db.prepare('SELECT id,name,size,added FROM attachments WHERE std_id=? AND ctrl_id=?').all(req.params.stdId, req.params.ctrlId);
+  const { stdId, ctrlId } = req.params;
+  const procId = req.query.procId;
+  const rows = procId !== undefined
+    ? db.prepare('SELECT id,name,size,added,proc_id FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=?').all(stdId, ctrlId, procId)
+    : db.prepare('SELECT id,name,size,added,proc_id FROM attachments WHERE std_id=? AND ctrl_id=?').all(stdId, ctrlId);
   res.json(rows);
 });
 
 app.post('/api/attachments/:stdId/:ctrlId', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
   const { stdId, ctrlId } = req.params;
+  const procId = req.body.procId || req.query.procId || '';
   const id   = uuidv4();
   const name = req.file.originalname;
-  // Remove existing with same name
-  const existing = db.prepare('SELECT path FROM attachments WHERE std_id=? AND ctrl_id=? AND name=?').get(stdId, ctrlId, name);
+  // Remove existing with same name at same proc level
+  const existing = db.prepare('SELECT path FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=? AND name=?').get(stdId, ctrlId, procId, name);
   if (existing) {
     try { fs.unlinkSync(existing.path); } catch(e) {}
-    db.prepare('DELETE FROM attachments WHERE std_id=? AND ctrl_id=? AND name=?').run(stdId, ctrlId, name);
+    db.prepare('DELETE FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=? AND name=?').run(stdId, ctrlId, procId, name);
   }
-  db.prepare('INSERT INTO attachments (id,std_id,ctrl_id,name,path,size,added) VALUES (?,?,?,?,?,?,?)').run(
-    id, stdId, ctrlId, name, req.file.path, req.file.size, new Date().toISOString()
+  db.prepare('INSERT INTO attachments (id,std_id,ctrl_id,proc_id,name,path,size,added) VALUES (?,?,?,?,?,?,?,?)').run(
+    id, stdId, ctrlId, procId, name, req.file.path, req.file.size, new Date().toISOString()
   );
   res.json({ ok: true, id, name, size: req.file.size });
 });
 
 app.delete('/api/attachments/:stdId/:ctrlId/:name', requireAuth, (req, res) => {
   const { stdId, ctrlId, name } = req.params;
-  const row = db.prepare('SELECT path FROM attachments WHERE std_id=? AND ctrl_id=? AND name=?').get(stdId, ctrlId, decodeURIComponent(name));
+  const procId = req.query.procId || '';
+  const decodedName = decodeURIComponent(name);
+  const row = db.prepare('SELECT path FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=? AND name=?').get(stdId, ctrlId, procId, decodedName);
   if (row) {
     try { fs.unlinkSync(row.path); } catch(e) {}
-    db.prepare('DELETE FROM attachments WHERE std_id=? AND ctrl_id=? AND name=?').run(stdId, ctrlId, decodeURIComponent(name));
+    db.prepare('DELETE FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=? AND name=?').run(stdId, ctrlId, procId, decodedName);
   }
   res.json({ ok: true });
 });
 
 app.get('/api/attachments/:stdId/:ctrlId/:name/download', requireAuth, (req, res) => {
-  const row = db.prepare('SELECT path,name FROM attachments WHERE std_id=? AND ctrl_id=? AND name=?')
-    .get(req.params.stdId, req.params.ctrlId, decodeURIComponent(req.params.name));
+  const { stdId, ctrlId, name } = req.params;
+  const procId = req.query.procId || '';
+  const row = db.prepare('SELECT path,name FROM attachments WHERE std_id=? AND ctrl_id=? AND proc_id=? AND name=?')
+    .get(stdId, ctrlId, procId, decodeURIComponent(name));
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.download(row.path, row.name);
 });
@@ -511,12 +406,13 @@ app.get('/api/attachments/:stdId/:ctrlId/:name/download', requireAuth, (req, res
 app.post('/api/audit', requireAuth, (req, res) => {
   const entries = Array.isArray(req.body) ? req.body : [req.body];
   const ins = db.prepare(`INSERT INTO audit_log
-    (ts,ts_display,std_id,std_label,std_color,ctrl_id,ctrl_name,field,from_val,to_val,status,assessor,notes_preview,action)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+    (ts,ts_display,std_id,std_label,std_color,ctrl_id,ctrl_name,proc_id,field,from_val,to_val,status,assessor,notes_preview,action)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
   try {
     const insertAll = db.transaction(rows => rows.forEach(e => ins.run(
       e.ts||new Date().toISOString(), e.ts_display||new Date().toLocaleString(),
       e.std_id||'', e.std_label||'', e.std_color||'', e.ctrl_id||'', e.ctrl_name||'',
+      e.proc_id||'',
       e.field||'', e.from_val||'', e.to_val||'', e.status||'', e.assessor||'',
       e.notes_preview||'', e.action||'saved'
     )));
@@ -667,7 +563,7 @@ function makeAvatarColor(username) {
   return cols[h % cols.length];
 }
 
-// ── Start server ──────────────────────────────────────────────────────
+// ── Start ──────────────────────────────────────────────────────────────
 initDB();
 app.listen(PORT, () => {
   console.log(`GRC Assessment Server running on http://localhost:${PORT}`);
