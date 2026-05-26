@@ -435,6 +435,7 @@ header{height:52px;background:var(--surface);border-bottom:1px solid var(--borde
     <span class="user-pill-name" id="user-pill-name"></span>
   </div>
   <button class="btn btn-settings" onclick="openSettings()" title="Settings — API Key &amp; Preferences" style="margin-left:8px">⚙ Settings</button>
+  <button class="btn btn-danger" id="hdr-signout-btn" onclick="logoutUser()" title="Sign Out" style="margin-left:4px;font-size:12px;padding:5px 10px;display:none">⏻ Sign Out</button>
 </header>
 
 <!-- ══ AUTH OVERLAY ══ -->
@@ -830,6 +831,22 @@ header{height:52px;background:var(--surface);border-bottom:1px solid var(--borde
             <div class="auth-err" id="chpw-err"></div>
             <button class="btn btn-primary" onclick="changeMyPassword()" style="align-self:flex-start">Update Password</button>
           </div>
+        </div>
+
+        <div class="settings-card" id="session-timeout-card">
+          <div class="settings-title">⏱ Session Timeout</div>
+          <div class="settings-desc" style="margin-bottom:12px">Automatically sign out after a period of inactivity. Set to 0 to disable.</div>
+          <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+            <input type="range" id="timeout-slider" min="0" max="60" step="5" value="15"
+              style="flex:1;min-width:160px;accent-color:var(--accent)"
+              oninput="onTimeoutSlide(this.value)">
+            <span id="timeout-display" style="font-size:13px;font-weight:600;color:var(--accent);min-width:80px">15 minutes</span>
+          </div>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);margin-top:4px">
+            <span>No timeout</span><span>15 min</span><span>30 min</span><span>45 min</span><span>60 min</span>
+          </div>
+          <button class="btn btn-primary" onclick="saveTimeoutSetting()" style="margin-top:12px;font-size:12px;padding:5px 14px">Save Timeout</button>
+          <span id="timeout-save-msg" style="font-size:11px;color:var(--green);margin-left:8px;display:none">✓ Saved</span>
         </div>
 
         <div class="settings-card" id="manage-standards-card" style="display:none">
@@ -8127,6 +8144,9 @@ async function enterApp() {
   // Reveal the header now that we have a valid session
   const hdr = document.getElementById('main-header');
   if (hdr) hdr.style.visibility = '';
+  // Fetch API key and timeout setting — user is authenticated so requireAuth will pass
+  apiKey = await api.getApiKey().catch(() => '');
+  await loadTimeoutSetting();
   // Check if user must change password before continuing
   if (currentUser && currentUser.must_change_password) {
     showForcePwChange();
@@ -8240,6 +8260,42 @@ async function setupSubmit() {
 }
 
 // ── Logout ─────────────────────────────────────────────
+// ── Session timeout setting ──────────────────────────────────────────
+function onTimeoutSlide(val) {
+  const n = parseInt(val);
+  const el = document.getElementById('timeout-display');
+  if (el) el.textContent = n === 0 ? 'No timeout' : n + ' minute' + (n === 1 ? '' : 's');
+}
+
+async function loadTimeoutSetting() {
+  try {
+    const result = await _get('/api/settings/session_timeout');
+    const minutes = parseInt(result.value) || 15;
+    INACTIVITY_MS = minutes === 0 ? 0 : minutes * 60 * 1000;
+    const slider = document.getElementById('timeout-slider');
+    if (slider) slider.value = minutes;
+    onTimeoutSlide(minutes);
+    // Restart timer with new value
+    if (currentUser) {
+      stopInactivityTimer();
+      startInactivityTimer();
+    }
+  } catch(e) {}
+}
+
+async function saveTimeoutSetting() {
+  const slider = document.getElementById('timeout-slider');
+  const minutes = parseInt(slider?.value ?? 15);
+  await _put('/api/settings/session_timeout', { value: String(minutes) });
+  INACTIVITY_MS = minutes === 0 ? 0 : minutes * 60 * 1000;
+  // Restart timer with new value
+  stopInactivityTimer();
+  if (minutes !== 0 && currentUser) startInactivityTimer();
+  const msg = document.getElementById('timeout-save-msg');
+  if (msg) { msg.style.display = 'inline'; setTimeout(() => msg.style.display = 'none', 2500); }
+  toast(minutes === 0 ? 'Session timeout disabled.' : `Session timeout set to ${minutes} minutes.`, 'ok');
+}
+
 async function logoutUser() {
   if (!confirm('Sign out of GRC Assessment Platform?')) return;
   if (isDirty && selectedId) await autoSaveCtrl();
@@ -8247,6 +8303,8 @@ async function logoutUser() {
   await api.logout();
   currentUser = null;
   document.getElementById('user-pill').style.display = 'none';
+  const _sob = document.getElementById('hdr-signout-btn');
+  if (_sob) _sob.style.display = 'none';
   document.getElementById('hdr-actions').style.display = 'none';
   document.getElementById('picker-screen').classList.add('gone');
   document.getElementById('main-app').style.display = 'none';
@@ -8258,6 +8316,7 @@ async function logoutUser() {
 function updateUserPill() {
   if (!currentUser) return;
   const pill   = document.getElementById('user-pill');
+  const signOutBtn = document.getElementById('hdr-signout-btn');
   const avatar = document.getElementById('user-avatar');
   const name   = document.getElementById('user-pill-name');
   if (!pill) return;
@@ -8265,6 +8324,7 @@ function updateUserPill() {
   avatar.style.background = currentUser.color || makeAvatarColor(currentUser.username);
   name.textContent = currentUser.name;
   pill.style.display = 'flex';
+  if (signOutBtn) signOutBtn.style.display = '';
   // Settings panel
   const sa = document.getElementById('settings-user-avatar');
   const sn = document.getElementById('settings-user-name');
@@ -8477,12 +8537,13 @@ function checkForcePwStrength() {
 }
 
 // ── Inactivity timeout (60 minutes) ────────────────────────────
-const INACTIVITY_MS = 60 * 60 * 1000;  // 60 minutes
+let INACTIVITY_MS = 15 * 60 * 1000;  // default 15 minutes — overridden by saved setting
 let inactivityTimer = null;
 
 function resetInactivityTimer() {
   if (!currentUser) return;
   clearTimeout(inactivityTimer);
+  if (INACTIVITY_MS === 0) return; // 0 = no timeout
   inactivityTimer = setTimeout(sessionExpired, INACTIVITY_MS);
 }
 
